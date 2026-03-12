@@ -1,6 +1,18 @@
 """
-Main pipeline: generate data, train both recommenders, evaluate, and analyze fairness.
-Run: python main.py
+Main pipeline: Evaluating Personalized Advertising Recommender Systems.
+
+Runs the full experiment end-to-end:
+  1. Load data (real Kaggle CSV or generate synthetic)
+  2. Train/test split (80/20, stratified)
+  3. Train & evaluate popularity-based recommender
+  4. Train & evaluate personalized recommender (LightGBM)
+  5. Compare accuracy (Precision@K, Recall@K, AUC-ROC)
+  6. Analyze fairness (exposure distribution, Gini, demographic parity)
+  7. Save results to CSV
+
+Usage:
+  python main.py                              # uses synthetic data
+  python main.py data/social_media_ad_engagement.csv  # uses real Kaggle data
 """
 import sys
 import os
@@ -9,180 +21,208 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-# Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
 
 from data.generate_data import generate_dataset
 from src.popularity_recommender import PopularityRecommender
 from src.personalized_recommender import PersonalizedRecommender
 from src.evaluation import (
-    get_relevant_items, evaluate_recommendations, compute_summary, compute_prediction_metrics
+    get_relevant_items, evaluate_recommendations,
+    compute_summary, compute_prediction_metrics,
 )
-from src.fairness import fairness_report, category_concentration, exposure_by_group
+from src.fairness import (
+    exposure_by_group, category_concentration, accuracy_by_group,
+)
 
+
+# ──────────────────────────────────────────────────────────────
+# Data loading
+# ──────────────────────────────────────────────────────────────
+
+def load_kaggle_data(csv_path: str):
+    """
+    Load the real Kaggle dataset and extract users / ads / interactions.
+
+    The Kaggle CSV has one row per interaction with all columns merged.
+    We split it into the three logical tables our pipeline expects.
+    """
+    df = pd.read_csv(csv_path)
+
+    # Standardise column names (handle minor variations)
+    col_map = {
+        "device": "device_type",
+        "category": "ad_category",
+        "duration": "ad_duration",
+        "type": "ad_type",
+    }
+    df.rename(columns={k: v for k, v in col_map.items() if k in df.columns}, inplace=True)
+
+    user_cols = ["user_id", "age", "gender", "location", "device_type"]
+    ad_cols = ["ad_id", "ad_type", "ad_category", "ad_duration"]
+
+    users = df[user_cols].drop_duplicates("user_id").reset_index(drop=True)
+    ads = df[ad_cols].drop_duplicates("ad_id").reset_index(drop=True)
+
+    keep = user_cols + ad_cols + ["engaged"]
+    keep = [c for c in keep if c in df.columns]
+    interactions = df[keep].copy()
+
+    return users, ads, interactions
+
+
+def load_data(csv_path=None):
+    """Load real data if a path is given, otherwise generate synthetic data."""
+    if csv_path and os.path.exists(csv_path):
+        print(f"  Loading real dataset: {csv_path}")
+        return load_kaggle_data(csv_path)
+    else:
+        print("  No real dataset found — generating synthetic data")
+        return generate_dataset()
+
+
+# ──────────────────────────────────────────────────────────────
+# Main pipeline
+# ──────────────────────────────────────────────────────────────
 
 def main():
     K_VALUES = [5, 10, 20]
-    K_MAIN = 10  # primary K for fairness analysis
+    K = 10  # primary K for fairness analysis
 
-    # ================================================================
-    # 1. GENERATE / LOAD DATA
-    # ================================================================
+    csv_path = sys.argv[1] if len(sys.argv) > 1 else "data/social_media_ad_engagement.csv"
+
+    # ── 1. DATA ──────────────────────────────────────────────
     print("=" * 60)
-    print("STEP 1: Generating dataset")
+    print("STEP 1: Loading data")
     print("=" * 60)
-    users, ads, interactions = generate_dataset(
-        n_users=5000, n_ads=200, n_interactions=100_000, seed=42
-    )
-    print(f"  Users:        {len(users):,}")
-    print(f"  Ads:          {len(ads):,}")
-    print(f"  Interactions: {len(interactions):,}")
+    users, ads, interactions = load_data(csv_path)
+    print(f"  Users:           {len(users):,}")
+    print(f"  Ads:             {len(ads):,}")
+    print(f"  Interactions:    {len(interactions):,}")
     print(f"  Engagement rate: {interactions['engaged'].mean():.1%}")
 
-    # Save data
-    users.to_csv("data/users.csv", index=False)
-    ads.to_csv("data/ads.csv", index=False)
-    interactions.to_csv("data/interactions.csv", index=False)
-
-    # ================================================================
-    # 2. TRAIN/TEST SPLIT
-    # ================================================================
+    # ── 2. TRAIN/TEST SPLIT ─────────────────────────────────
     print(f"\nSTEP 2: Train/test split (80/20, stratified)")
     train, test = train_test_split(
-        interactions, test_size=0.2, random_state=42, stratify=interactions["engaged"]
+        interactions, test_size=0.2, random_state=42,
+        stratify=interactions["engaged"],
     )
     print(f"  Train: {len(train):,}  |  Test: {len(test):,}")
-    print(f"  Train engagement: {train['engaged'].mean():.1%}  |  Test: {test['engaged'].mean():.1%}")
 
     relevant = get_relevant_items(test)
-    test_user_ids = test["user_id"].unique()
-    print(f"  Test users: {len(test_user_ids):,}")
-    print(f"  Users with engagements: {len(relevant):,}")
+    test_uids = test["user_id"].unique()
+    print(f"  Test users: {len(test_uids):,}  |  With engagements: {len(relevant):,}")
 
-    # ================================================================
-    # 3. POPULARITY-BASED RECOMMENDER
-    # ================================================================
+    # ── 3. POPULARITY RECOMMENDER ────────────────────────────
     print(f"\n{'=' * 60}")
     print("STEP 3: Popularity-Based Recommender")
     print("=" * 60)
-    pop_rec = PopularityRecommender(min_impressions=5)
-    pop_rec.fit(train)
-
-    pop_recs = pop_rec.recommend_all(test_user_ids, k=max(K_VALUES))
+    pop = PopularityRecommender(min_impressions=5)
+    pop.fit(train)
+    pop_recs = pop.recommend_all(test_uids, k=max(K_VALUES))
     pop_eval = evaluate_recommendations(pop_recs, relevant, K_VALUES)
     pop_summary = compute_summary(pop_eval, K_VALUES)
 
-    print("\n  Performance:")
-    for metric, value in pop_summary.items():
-        print(f"    {metric}: {value:.4f}")
+    print("\n  Accuracy:")
+    for m, v in pop_summary.items():
+        print(f"    {m}: {v:.4f}")
 
-    # ================================================================
-    # 4. PERSONALIZED RECOMMENDER
-    # ================================================================
+    # ── 4. PERSONALIZED RECOMMENDER ──────────────────────────
     print(f"\n{'=' * 60}")
     print("STEP 4: Personalized Recommender (LightGBM)")
     print("=" * 60)
-    pers_rec = PersonalizedRecommender()
+    pers = PersonalizedRecommender()
 
     t0 = time.time()
-    pers_rec.fit(train)
+    pers.fit(train)
     print(f"  Training time: {time.time() - t0:.1f}s")
 
-    # Predict on test set for AUC-ROC
-    test_preds = pers_rec.predict(test)
+    # Raw prediction quality on test set
+    test_preds = pers.predict(test)
     pred_metrics = compute_prediction_metrics(test["engaged"].values, test_preds)
-    print(f"\n  Prediction metrics:")
-    for metric, value in pred_metrics.items():
-        print(f"    {metric}: {value:.4f}")
+    print(f"  AUC-ROC:  {pred_metrics['AUC-ROC']:.4f}")
+    print(f"  Log-loss: {pred_metrics['Log-loss']:.4f}")
 
-    # Generate recommendations for test users (sample for speed)
-    sample_size = min(500, len(test_user_ids))
-    sample_users = np.random.default_rng(42).choice(test_user_ids, sample_size, replace=False)
-    sample_user_df = users[users["user_id"].isin(sample_users)]
+    # Generate per-user recommendations (sample for speed)
+    n_sample = min(500, len(test_uids))
+    sample_uids = np.random.default_rng(42).choice(test_uids, n_sample, replace=False)
+    sample_users = users[users["user_id"].isin(sample_uids)]
 
-    print(f"\n  Generating recommendations for {sample_size} users...")
+    print(f"\n  Generating top-{max(K_VALUES)} for {n_sample} users...")
     t0 = time.time()
-    pers_recs, pers_scores = pers_rec.recommend_all(sample_user_df, ads, k=max(K_VALUES))
-    print(f"  Recommendation time: {time.time() - t0:.1f}s")
+    pers_recs, _ = pers.recommend_all(sample_users, ads, k=max(K_VALUES))
+    print(f"  Done in {time.time() - t0:.1f}s")
 
     pers_eval = evaluate_recommendations(pers_recs, relevant, K_VALUES)
     pers_summary = compute_summary(pers_eval, K_VALUES)
 
-    print("\n  Performance:")
-    for metric, value in pers_summary.items():
-        print(f"    {metric}: {value:.4f}")
+    print("\n  Accuracy:")
+    for m, v in pers_summary.items():
+        print(f"    {m}: {v:.4f}")
 
-    # ================================================================
-    # 5. COMPARISON
-    # ================================================================
+    # ── 5. COMPARISON ────────────────────────────────────────
     print(f"\n{'=' * 60}")
-    print("STEP 5: Comparison")
+    print("STEP 5: Accuracy Comparison")
     print("=" * 60)
 
-    # Filter pop_eval to same users for fair comparison
-    pop_eval_sample = pop_eval[pop_eval["user_id"].isin(sample_users)]
-    pop_summary_sample = compute_summary(pop_eval_sample, K_VALUES)
+    pop_eval_s = pop_eval[pop_eval["user_id"].isin(sample_uids)]
+    pop_sum_s = compute_summary(pop_eval_s, K_VALUES)
 
     print(f"\n  {'Metric':<15} {'Popularity':>12} {'Personalized':>14} {'Delta':>10}")
-    print(f"  {'-'*55}")
+    print(f"  {'-' * 55}")
     for k in K_VALUES:
-        for metric_type in ["Precision", "Recall"]:
-            key = f"{metric_type}@{k}"
-            pop_val = pop_summary_sample[key]
-            pers_val = pers_summary[key]
-            delta = ((pers_val - pop_val) / max(pop_val, 1e-8)) * 100
-            print(f"  {key:<15} {pop_val:>12.4f} {pers_val:>14.4f} {delta:>+9.1f}%")
+        for mt in ["Precision", "Recall"]:
+            key = f"{mt}@{k}"
+            pv, rv = pop_sum_s[key], pers_summary[key]
+            d = ((rv - pv) / max(pv, 1e-8)) * 100
+            print(f"  {key:<15} {pv:>12.4f} {rv:>14.4f} {d:>+9.1f}%")
 
     print(f"\n  AUC-ROC (personalized): {pred_metrics['AUC-ROC']:.4f}")
-    print(f"  Log-loss (personalized): {pred_metrics['Log-loss']:.4f}")
 
-    # ================================================================
-    # 6. FAIRNESS ANALYSIS
-    # ================================================================
+    # ── 6. FAIRNESS ANALYSIS ─────────────────────────────────
     print(f"\n{'=' * 60}")
     print("STEP 6: Fairness Analysis")
     print("=" * 60)
 
-    for system_name, recs, eval_df in [
-        ("Popularity", {uid: pop_recs[uid] for uid in sample_users}, pop_eval_sample),
+    users_s = users[users["user_id"].isin(sample_uids)].copy()
+    users_s["age_group"] = pd.cut(users_s["age"], bins=[17, 25, 35, 45, 65],
+                                   labels=["18-25", "26-35", "36-45", "46-65"])
+
+    for name, recs, ev in [
+        ("Popularity", {u: pop_recs[u] for u in sample_uids}, pop_eval_s),
         ("Personalized", pers_recs, pers_eval),
     ]:
-        print(f"\n  --- {system_name} ---")
+        print(f"\n  ── {name} {'─' * (40 - len(name))}")
 
         # Category concentration
-        conc = category_concentration(recs, ads, K_MAIN)
-        print(f"  Gini coefficient: {conc['gini']:.3f}")
+        conc = category_concentration(recs, ads, K)
+        print(f"  Gini coefficient:      {conc['gini']:.3f}")
         print(f"  Categories represented: {conc['n_categories_represented']}")
-        print(f"  Top category share: {conc['top_category_share']:.1%}")
+        print(f"  Top category share:    {conc['top_category_share']:.1%}")
 
         # Accuracy by gender
-        eval_merged = eval_df.merge(users[["user_id", "gender", "age"]], on="user_id")
-        gender_acc = eval_merged.groupby("gender")[f"precision@{K_MAIN}"].mean()
-        print(f"\n  Precision@{K_MAIN} by gender:")
-        for g, v in gender_acc.items():
+        ev_m = ev.merge(users_s[["user_id", "gender"]], on="user_id")
+        g_acc = ev_m.groupby("gender")[f"precision@{K}"].mean()
+        print(f"\n  Precision@{K} by gender:")
+        for g, v in g_acc.items():
             print(f"    {g}: {v:.4f}")
 
         # Accuracy by age group
-        eval_merged["age_group"] = pd.cut(eval_merged["age"], bins=[17, 25, 35, 45, 65],
-                                           labels=["18-25", "26-35", "36-45", "46-65"])
-        age_acc = eval_merged.groupby("age_group", observed=True)[f"precision@{K_MAIN}"].mean()
-        print(f"\n  Precision@{K_MAIN} by age group:")
-        for g, v in age_acc.items():
+        ev_a = ev.merge(users_s[["user_id", "age_group"]], on="user_id")
+        a_acc = ev_a.groupby("age_group", observed=True)[f"precision@{K}"].mean()
+        print(f"\n  Precision@{K} by age group:")
+        for g, v in a_acc.items():
             print(f"    {g}: {v:.4f}")
 
         # Exposure by gender
-        users_sample = users[users["user_id"].isin(sample_users)]
-        exp = exposure_by_group(recs, users_sample, ads, "gender", K_MAIN)
+        exp = exposure_by_group(recs, users_s, ads, "gender", K)
         if not exp.empty:
-            print(f"\n  Exposure distribution by gender (top categories):")
-            for gender in exp.index:
-                top3 = exp.loc[gender].nlargest(3)
-                cats = ", ".join([f"{c}: {v:.1%}" for c, v in top3.items()])
-                print(f"    {gender}: {cats}")
+            print(f"\n  Ad category exposure by gender:")
+            for grp in exp.index:
+                top3 = exp.loc[grp].nlargest(3)
+                cats = ", ".join(f"{c}: {v:.1%}" for c, v in top3.items())
+                print(f"    {grp}: {cats}")
 
-    # ================================================================
-    # 7. SAVE RESULTS
-    # ================================================================
+    # ── 7. SAVE ──────────────────────────────────────────────
     print(f"\n{'=' * 60}")
     print("STEP 7: Saving results")
     print("=" * 60)
@@ -191,17 +231,13 @@ def main():
     pop_eval.to_csv("results/popularity_evaluation.csv", index=False)
     pers_eval.to_csv("results/personalized_evaluation.csv", index=False)
 
-    # Summary comparison
-    comparison = []
+    rows = []
     for k in K_VALUES:
         for mt in ["Precision", "Recall"]:
             key = f"{mt}@{k}"
-            comparison.append({
-                "Metric": key,
-                "Popularity": pop_summary_sample[key],
-                "Personalized": pers_summary[key],
-            })
-    pd.DataFrame(comparison).to_csv("results/comparison.csv", index=False)
+            rows.append({"Metric": key, "Popularity": pop_sum_s[key],
+                          "Personalized": pers_summary[key]})
+    pd.DataFrame(rows).to_csv("results/comparison.csv", index=False)
 
     print("  Saved to results/")
     print("\nDone!")

@@ -3,7 +3,7 @@
 A technical and ethical analysis of popularity-based vs. personalized ad recommendation.
 
 **Authors:** Manno Elwasty, Kadir Kara, Haseeb Shamsul, Wesley van der Engh
-**Course:** Introduction to Modeling Systems Dynamics, University of Amsterdam
+**Course:** Recommender systems, University of Amsterdam
 
 ## Project Structure
 

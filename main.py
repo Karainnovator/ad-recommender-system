@@ -31,8 +31,13 @@ from src.evaluation import (
     compute_summary, compute_prediction_metrics,
 )
 from src.fairness import (
-    exposure_by_group, category_concentration, accuracy_by_group,
+    exposure_by_group, category_concentration,
+    exposure_divergence, accuracy_equity,
+    provider_fairness, fairness_scorecard, compare_systems,
+    print_fairness_report, print_comparison_report,
 )
+from src.bias import run_bias_audit, print_bias_report, calibration_summary
+from src.fair_reranker import FairReranker
 
 
 # ──────────────────────────────────────────────────────────────
@@ -87,6 +92,7 @@ def load_data(csv_path=None):
 def main():
     K_VALUES = [5, 10, 20]
     K = 10  # primary K for fairness analysis
+    CANDIDATE_K = 50  # larger pool for fair re-ranking
 
     csv_path = sys.argv[1] if len(sys.argv) > 1 else "data/social_media_ad_engagement.csv"
 
@@ -118,7 +124,7 @@ def main():
     print("=" * 60)
     pop = PopularityRecommender(min_impressions=5)
     pop.fit(train)
-    pop_recs = pop.recommend_all(test_uids, k=max(K_VALUES))
+    pop_recs = pop.recommend_all(test_uids, k=CANDIDATE_K)
     pop_eval = evaluate_recommendations(pop_recs, relevant, K_VALUES)
     pop_summary = compute_summary(pop_eval, K_VALUES)
 
@@ -147,10 +153,13 @@ def main():
     sample_uids = np.random.default_rng(42).choice(test_uids, n_sample, replace=False)
     sample_users = users[users["user_id"].isin(sample_uids)]
 
-    print(f"\n  Generating top-{max(K_VALUES)} for {n_sample} users...")
+    print(f"\n  Generating top-{CANDIDATE_K} candidates for {n_sample} users...")
     t0 = time.time()
-    pers_recs, _ = pers.recommend_all(sample_users, ads, k=max(K_VALUES))
+    pers_candidates, pers_scores = pers.recommend_all(sample_users, ads, k=CANDIDATE_K)
     print(f"  Done in {time.time() - t0:.1f}s")
+
+    # Slice to top-K_VALUES for original evaluation (same as before)
+    pers_recs = {uid: recs[:max(K_VALUES)] for uid, recs in pers_candidates.items()}
 
     pers_eval = evaluate_recommendations(pers_recs, relevant, K_VALUES)
     pers_summary = compute_summary(pers_eval, K_VALUES)
@@ -187,6 +196,8 @@ def main():
     users_s["age_group"] = pd.cut(users_s["age"], bins=[17, 25, 35, 45, 65],
                                    labels=["18-25", "26-35", "36-45", "46-65"])
 
+    scorecards = {}
+
     for name, recs, ev in [
         ("Popularity", {u: pop_recs[u] for u in sample_uids}, pop_eval_s),
         ("Personalized", pers_recs, pers_eval),
@@ -199,19 +210,31 @@ def main():
         print(f"  Categories represented: {conc['n_categories_represented']}")
         print(f"  Top category share:    {conc['top_category_share']:.1%}")
 
-        # Accuracy by gender
-        ev_m = ev.merge(users_s[["user_id", "gender"]], on="user_id")
-        g_acc = ev_m.groupby("gender")[f"precision@{K}"].mean()
-        print(f"\n  Precision@{K} by gender:")
-        for g, v in g_acc.items():
-            print(f"    {g}: {v:.4f}")
+        # Provider fairness (ad-side)
+        pf = provider_fairness(recs, ads, K)
+        if pf:
+            print(f"\n  Provider fairness:")
+            print(f"    Catalog coverage: {pf['catalog_coverage']}%")
+            print(f"    HHI: {pf['hhi']:.4f} ({pf['hhi_verdict']})")
+            print(f"    Ads with zero exposure: {pf['zero_exposure_count']} ({pf['zero_exposure_pct']}%)")
 
-        # Accuracy by age group
-        ev_a = ev.merge(users_s[["user_id", "age_group"]], on="user_id")
-        a_acc = ev_a.groupby("age_group", observed=True)[f"precision@{K}"].mean()
-        print(f"\n  Precision@{K} by age group:")
-        for g, v in a_acc.items():
-            print(f"    {g}: {v:.4f}")
+        # Exposure divergence between groups
+        for col in ["gender", "age_group"]:
+            div_df = exposure_divergence(recs, users_s, ads, col, K)
+            if not div_df.empty:
+                print(f"\n  Exposure divergence ({col}):")
+                for _, row in div_df.iterrows():
+                    print(f"    {row['group_a']} vs {row['group_b']}: "
+                          f"JSD={row['jsd']:.4f}")
+
+        # Accuracy equity (statistical + practical significance)
+        for col in ["gender", "age_group"]:
+            eq = accuracy_equity(ev, users_s, col, K)
+            print(f"\n  Accuracy equity ({col}):")
+            print(f"    Gap ratio: {eq['gap_ratio']:.3f} "
+                  f"(best: {eq['best_served']}, worst: {eq['worst_served']})")
+            print(f"    Effect size: ε²={eq['epsilon_squared']:.4f} "
+                  f"({eq['effect_size']}), p={eq['kruskal_p_value']:.4f}")
 
         # Exposure by gender
         exp = exposure_by_group(recs, users_s, ads, "gender", K)
@@ -222,9 +245,154 @@ def main():
                 cats = ", ".join(f"{c}: {v:.1%}" for c, v in top3.items())
                 print(f"    {grp}: {cats}")
 
-    # ── 7. SAVE ──────────────────────────────────────────────
+        # Fairness scorecard
+        sc = fairness_scorecard(recs, ev, users_s, ads, relevant, K)
+        scorecards[name] = sc
+        print_fairness_report(sc, system_name=name)
+
+    # Cross-system comparison
+    if len(scorecards) == 2:
+        comparison = compare_systems(scorecards)
+        print_comparison_report(comparison, list(scorecards.keys()))
+
+    # ── 7. BIAS AUDIT ─────────────────────────────────────────
     print(f"\n{'=' * 60}")
-    print("STEP 7: Saving results")
+    print("STEP 7: Bias Audit")
+    print("=" * 60)
+
+    for name, recs, ev in [
+        ("Popularity", {u: pop_recs[u] for u in sample_uids}, pop_eval_s),
+        ("Personalized", pers_recs, pers_eval),
+    ]:
+        audit = run_bias_audit(
+            recommendations=recs,
+            relevant_items=relevant,
+            interactions=train,
+            users=users_s,
+            ads=ads,
+            eval_df=ev,
+            k=K,
+        )
+        print_bias_report(audit, system_name=name)
+
+    # Calibration bias (personalized model only)
+    # test already has gender from data generation; merge only if missing
+    if "gender" in test.columns:
+        gender_col = test["gender"].values
+    else:
+        gender_col = test.merge(users[["user_id", "gender"]], on="user_id")["gender"].values
+    cal = calibration_summary(
+        y_true=test["engaged"].values,
+        y_pred=test_preds,
+        groups=gender_col,
+    )
+    if not cal.empty:
+        print(f"\n  Calibration (ECE) by gender — personalized model:")
+        for _, row in cal.iterrows():
+            print(f"    {row['group']}: ECE={row['ECE']:.4f}")
+
+    # ── 8. FAIR RE-RANKING ──────────────────────────────────
+    print(f"\n{'=' * 60}")
+    print("STEP 8: Fair Re-ranking (accuracy vs fairness trade-off)")
+    print("=" * 60)
+
+    # Build candidate pools for re-ranking
+    pop_candidates_s = {u: pop_recs[u] for u in sample_uids}
+
+    # Test multiple lambda values for the personalized recommender
+    lambdas = [1.0, 0.7, 0.5, 0.3]
+    print(f"\n  MMR diversity re-ranking (personalized model)")
+    print(f"  Candidates per user: {CANDIDATE_K} → select top-{max(K_VALUES)}")
+    print(f"\n  {'λ':<6} {'Prec@10':>8} {'Rec@10':>8} {'Gini':>6} "
+          f"{'HHI':>6} {'Coverage':>9} {'MaxJSD(g)':>10} {'Stereo':>7}")
+    print(f"  {'-' * 65}")
+
+    fair_variants = {}
+    for lam in lambdas:
+        reranker = FairReranker(ads, strategy="mmr", lambda_param=lam)
+        fair_recs = reranker.rerank_all(
+            pers_candidates, k=max(K_VALUES), scores_dict=pers_scores
+        )
+        fair_eval = evaluate_recommendations(fair_recs, relevant, K_VALUES)
+        fair_sum = compute_summary(fair_eval, K_VALUES)
+
+        # Key fairness metrics
+        conc = category_concentration(fair_recs, ads, K)
+        pf = provider_fairness(fair_recs, ads, K)
+        div_df = exposure_divergence(fair_recs, users_s, ads, "gender", K)
+        max_jsd_g = div_df["jsd"].max() if not div_df.empty else 0.0
+
+        # Stereotyping count
+        from src.bias import bias_amplification
+        ba = bias_amplification(fair_recs, train, users_s, ads, "gender", K)
+        n_stereo = len(ba[ba["is_stereotyping"]]) if not ba.empty else 0
+
+        label = f"{lam:.1f}"
+        if lam == 1.0:
+            label += " (orig)"
+        print(f"  {label:<6} {fair_sum['Precision@10']:>8.4f} {fair_sum['Recall@10']:>8.4f} "
+              f"{conc['gini']:>6.3f} {pf['hhi']:>6.4f} "
+              f"{pf['catalog_coverage']:>8.1f}% {max_jsd_g:>10.4f} "
+              f"{n_stereo:>5}/24")
+
+        fair_variants[f"λ={lam}"] = {
+            "recs": fair_recs, "eval": fair_eval, "summary": fair_sum,
+        }
+
+    # Also test category cap
+    cap_reranker = FairReranker(ads, strategy="category_cap", category_cap=0.3)
+    cap_recs = cap_reranker.rerank_all(
+        pers_candidates, k=max(K_VALUES), scores_dict=pers_scores
+    )
+    cap_eval = evaluate_recommendations(cap_recs, relevant, K_VALUES)
+    cap_sum = compute_summary(cap_eval, K_VALUES)
+    cap_conc = category_concentration(cap_recs, ads, K)
+    cap_pf = provider_fairness(cap_recs, ads, K)
+    cap_div = exposure_divergence(cap_recs, users_s, ads, "gender", K)
+    cap_jsd = cap_div["jsd"].max() if not cap_div.empty else 0.0
+    cap_ba = bias_amplification(cap_recs, train, users_s, ads, "gender", K)
+    cap_stereo = len(cap_ba[cap_ba["is_stereotyping"]]) if not cap_ba.empty else 0
+
+    print(f"  {'cap30':<6} {cap_sum['Precision@10']:>8.4f} {cap_sum['Recall@10']:>8.4f} "
+          f"{cap_conc['gini']:>6.3f} {cap_pf['hhi']:>6.4f} "
+          f"{cap_pf['catalog_coverage']:>8.1f}% {cap_jsd:>10.4f} "
+          f"{cap_stereo:>5}/24")
+
+    # Show the best fair variant's full scorecard + bias audit
+    best_lam = 0.5
+    best_fair = fair_variants[f"λ={best_lam}"]
+    print(f"\n  ── Detailed analysis: Personalized + MMR (λ={best_lam}) ──")
+
+    # Fairness scorecard comparison: original vs fair
+    fair_sc = fairness_scorecard(
+        best_fair["recs"], best_fair["eval"], users_s, ads, relevant, K
+    )
+    print_fairness_report(fair_sc, system_name=f"Personalized + MMR (λ={best_lam})")
+
+    # Side-by-side: original personalized vs fair
+    all_scorecards = {
+        "Popularity": scorecards["Popularity"],
+        "Personalized": scorecards["Personalized"],
+        f"Pers+MMR(λ={best_lam})": fair_sc,
+    }
+    three_way = compare_systems(all_scorecards)
+    print_comparison_report(three_way, list(all_scorecards.keys()))
+
+    # Bias audit on the fair version
+    fair_audit = run_bias_audit(
+        recommendations=best_fair["recs"],
+        relevant_items=relevant,
+        interactions=train,
+        users=users_s,
+        ads=ads,
+        eval_df=best_fair["eval"],
+        k=K,
+    )
+    print_bias_report(fair_audit, system_name=f"Personalized + MMR (λ={best_lam})")
+
+    # ── 9. SAVE ──────────────────────────────────────────────
+    print(f"\n{'=' * 60}")
+    print("STEP 9: Saving results")
     print("=" * 60)
 
     os.makedirs("results", exist_ok=True)
